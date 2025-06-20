@@ -1,3 +1,8 @@
 
-# -O ReleaseSmall
-ZIG_LIB_DIR=$PWD/lib zig build-exe --name zig0 --dep build_options -Mroot=./src/zig0.zig -Mbuild_options=src/zig0_build_options.zig
+# usage:
+# sh mk-zig0.sh -l
+# sh mk-zig0.sh zig0 -- fetch --show-cache 'git+https://github.com/rockorager/libvaxis'
+# sh mk-zig0.sh -Doptimize=ReleaseSafe
+# sh mk-zig0.sh -Doptimize=ReleaseSmall
+
+zig build --build-file build0.zig $@
