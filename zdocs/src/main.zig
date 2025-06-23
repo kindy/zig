@@ -9,19 +9,22 @@ const assert = std.debug.assert;
 const Cache = std.Build.Cache;
 
 const print = std.debug.print;
+const log = std.log.scoped(.zdocs);
 
-fn usage() noreturn {
+fn usage(status: u8) noreturn {
     io.getStdOut().writeAll(
         \\Usage: zdocs [options]
         \\
         \\Options:
-        \\  -h, --help                Print this help and exit
-        \\  -p [port], --port [port]  Port to listen on. Default is 0, meaning an ephemeral port chosen by the system.
+        \\  -h, --help                Print this help and exit.
+        \\  -Mstd                     std Module
+        \\  -M<mod_name>=<src_path>   Module name and root source path.
+        \\  -p <port>, --port <port>  Port to listen on. Default is 0, meaning an ephemeral port chosen by the system.
         \\  --[no-]open-browser       Force enabling or disabling opening a browser tab to the served website.
         \\                            By default, enabled unless a port is specified.
         \\
     ) catch {};
-    std.process.exit(1);
+    std.process.exit(status);
 }
 
 pub fn main() !void {
@@ -46,15 +49,30 @@ pub fn main() !void {
     var lib_dir = try std.fs.cwd().openDir(zig_lib_directory, .{});
     defer lib_dir.close();
 
+    var mod_src_path: []const u8 = "";
+    var mod_name: []const u8 = "";
+
     var listen_port: u16 = 0;
     var force_open_browser: ?bool = null;
     while (argv.next()) |arg| {
+        log.debug("arg: '{s}'", .{arg});
+
         if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help")) {
-            usage();
+            usage(0);
         } else if (mem.eql(u8, arg, "-p") or mem.eql(u8, arg, "--port")) {
-            listen_port = std.fmt.parseInt(u16, argv.next() orelse usage(), 10) catch |err| {
+            listen_port = std.fmt.parseInt(u16, argv.next() orelse usage(1), 10) catch |err| {
                 std.log.err("expected port number: {}", .{err});
-                usage();
+                usage(1);
+            };
+        } else if (mem.startsWith(u8, arg, "-M")) {
+            // TODO: check multiple -M
+            var it = mem.splitScalar(u8, arg["-M".len..], '=');
+            mod_name = it.next().?;
+            mod_src_path = it.next() orelse d: {
+                if (mem.eql(u8, mod_name, "std")) {
+                    break :d try lib_dir.realpathAlloc(gpa, "std/std.zig");
+                }
+                fatal("expected module root_src_path after -M{d}", .{mod_name});
             };
         } else if (mem.eql(u8, arg, "--open-browser")) {
             force_open_browser = true;
@@ -62,10 +80,15 @@ pub fn main() !void {
             force_open_browser = false;
         } else {
             std.log.err("unrecognized argument: {s}", .{arg});
-            usage();
+            usage(1);
         }
     }
     const should_open_browser = force_open_browser orelse (listen_port == 0);
+
+    if (mod_name.len == 0) {
+        std.log.err("-M required", .{});
+        usage(1);
+    }
 
     const address = std.net.Address.parseIp("127.0.0.1", listen_port) catch unreachable;
     var http_server = try address.listen(.{});
@@ -85,11 +108,8 @@ pub fn main() !void {
         .lib_dir = lib_dir,
         .zig_lib_directory = zig_lib_directory,
 
-        .mod_dir = "../lib/compiler/aro",
-        .mod_name = "aro",
-
-        // .mod_dir = "../lib/std",
-        // .mod_name = "std",
+        .mod_src_path = mod_src_path,
+        .mod_name = mod_name,
     };
 
     while (true) {
@@ -129,7 +149,7 @@ const Context = struct {
     zig_exe_path: []const u8,
     global_cache_path: []const u8,
 
-    mod_dir: []const u8,
+    mod_src_path: []const u8,
     mod_name: []const u8,
 };
 
@@ -197,7 +217,8 @@ fn serveSourcesTar(request: *std.http.Server.Request, context: *Context) !void {
         },
     });
 
-    var mod_dir = try std.fs.cwd().openDir(context.mod_dir, .{ .iterate = true });
+    // TODO: dirname ?
+    var mod_dir = try std.fs.cwd().openDir(std.fs.path.dirname(context.mod_src_path).?, .{ .iterate = true });
     defer mod_dir.close();
 
     var walker = try mod_dir.walk(gpa);
@@ -447,6 +468,11 @@ fn openBrowserTabThread(gpa: Allocator, url: []const u8) !void {
     child.stderr_behavior = .Ignore;
     try child.spawn();
     _ = try child.wait();
+}
+
+pub fn fatal(comptime format: []const u8, args: anytype) noreturn {
+    std.log.err(format, args);
+    std.process.exit(1);
 }
 
 fn getZigEnv(ally: std.mem.Allocator) !std.json.Parsed(ZigEnvResult) {

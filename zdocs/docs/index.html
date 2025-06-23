@@ -108,6 +108,16 @@
       }
       #listNav li {
         float:left;
+        position: relative;
+      }
+      #listNav li:not(:first-child) {
+        padding-left: 3px;
+      }
+      #listNav li:not(:first-child)::before {
+        content: ".";
+        position: absolute;
+        top: 8px; left: -1px;
+        z-index: 1;
       }
       #listNav li a {
         display: block;
@@ -115,14 +125,27 @@
         text-align: center;
         padding: .5em .8em;
         text-decoration: none;
+        position: relative; z-index: 0;
+      }
+      #listNav li a::before {
+        content: '';
+        display: block;
+        position: absolute; z-index: -1;
+        width: 100%; height: 100%;
+        left: 0; top: 0;
+        transform: skewX(-10deg);
       }
       #listNav li a:hover {
-        background-color: #555;
         color: #fff;
       }
+      #listNav li a:hover::before {
+        background-color: #555;
+      }
       #listNav li a.active {
-        background-color: #FFBB4D;
         color: #000;
+      }
+      #listNav li a.active::before {
+        background-color: #FFBB4D;
       }
 
       #helpDialog {
