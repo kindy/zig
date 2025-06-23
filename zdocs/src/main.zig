@@ -1,3 +1,5 @@
+//! from zig/lib/compiler/std-docs.zig (6d1f0eca77)
+
 const builtin = @import("builtin");
 const std = @import("std");
 const mem = std.mem;
@@ -6,9 +8,11 @@ const Allocator = std.mem.Allocator;
 const assert = std.debug.assert;
 const Cache = std.Build.Cache;
 
+const print = std.debug.print;
+
 fn usage() noreturn {
     io.getStdOut().writeAll(
-        \\Usage: zig std [options]
+        \\Usage: zdocs [options]
         \\
         \\Options:
         \\  -h, --help                Print this help and exit
@@ -31,9 +35,13 @@ pub fn main() !void {
     var argv = try std.process.argsWithAllocator(arena);
     defer argv.deinit();
     assert(argv.skip());
-    const zig_lib_directory = argv.next().?;
-    const zig_exe_path = argv.next().?;
-    const global_cache_path = argv.next().?;
+
+    const v = try getZigEnv(gpa);
+    defer v.deinit();
+
+    const zig_lib_directory = v.value.lib_dir;
+    const zig_exe_path = v.value.zig_exe;
+    const global_cache_path = v.value.global_cache_dir;
 
     var lib_dir = try std.fs.cwd().openDir(zig_lib_directory, .{});
     defer lib_dir.close();
@@ -76,6 +84,12 @@ pub fn main() !void {
         .global_cache_path = global_cache_path,
         .lib_dir = lib_dir,
         .zig_lib_directory = zig_lib_directory,
+
+        .mod_dir = "../lib/compiler/aro",
+        .mod_name = "aro",
+
+        // .mod_dir = "../lib/std",
+        // .mod_name = "std",
     };
 
     while (true) {
@@ -114,6 +128,9 @@ const Context = struct {
     zig_lib_directory: []const u8,
     zig_exe_path: []const u8,
     global_cache_path: []const u8,
+
+    mod_dir: []const u8,
+    mod_name: []const u8,
 };
 
 fn serveRequest(request: *std.http.Server.Request, context: *Context) !void {
@@ -156,10 +173,7 @@ fn serveDocsFile(
     content_type: []const u8,
 ) !void {
     const gpa = context.gpa;
-    // The desired API is actually sendfile, which will require enhancing std.http.Server.
-    // We load the file with every request so that the user can make changes to the file
-    // and refresh the HTML page without restarting this server.
-    const file_contents = try context.lib_dir.readFileAlloc(gpa, name, 10 * 1024 * 1024);
+    const file_contents = try std.fs.cwd().readFileAlloc(gpa, name, 10 * 1024 * 1024);
     defer gpa.free(file_contents);
     try request.respond(file_contents, .{
         .extra_headers = &.{
@@ -183,14 +197,14 @@ fn serveSourcesTar(request: *std.http.Server.Request, context: *Context) !void {
         },
     });
 
-    var std_dir = try context.lib_dir.openDir("std", .{ .iterate = true });
-    defer std_dir.close();
+    var mod_dir = try std.fs.cwd().openDir(context.mod_dir, .{ .iterate = true });
+    defer mod_dir.close();
 
-    var walker = try std_dir.walk(gpa);
+    var walker = try mod_dir.walk(gpa);
     defer walker.deinit();
 
     var archiver = std.tar.writer(response.writer());
-    archiver.prefix = "std";
+    archiver.prefix = context.mod_name;
 
     while (try walker.next()) |entry| {
         switch (entry.kind) {
@@ -278,16 +292,10 @@ fn buildWasmBinary(
         "--global-cache-dir", context.global_cache_path, //
         "--name", autodoc_root_name, //
         "-rdynamic", //
-        "--dep", "Walk", //
         try std.fmt.allocPrint(
             arena,
-            "-Mroot={s}/docs/wasm/main.zig",
-            .{context.zig_lib_directory},
-        ),
-        try std.fmt.allocPrint(
-            arena,
-            "-MWalk={s}/docs/wasm/Walk.zig",
-            .{context.zig_lib_directory},
+            "-Mroot={s}",
+            .{try std.fs.cwd().realpathAlloc(arena, "src/wasm/main.zig")},
         ),
         "--listen=-", //
     });
@@ -440,3 +448,41 @@ fn openBrowserTabThread(gpa: Allocator, url: []const u8) !void {
     try child.spawn();
     _ = try child.wait();
 }
+
+fn getZigEnv(ally: std.mem.Allocator) !std.json.Parsed(ZigEnvResult) {
+    const p = try std.process.Child.run(.{
+        .allocator = ally,
+        .argv = &.{ "zig", "env" },
+    });
+    defer {
+        ally.free(p.stdout);
+        ally.free(p.stderr);
+    }
+
+    // print("zig env: {s}\nstderr: {s}\n", .{ p.stdout, p.stderr });
+
+    switch (p.term) {
+        .Exited => |code| {
+            if (code != 0) {
+                std.log.err("zig env command exited with code {d}\n stderr: {s}", .{ code, p.stderr });
+                return error.ZigCommandFailed;
+            }
+        },
+        .Signal, .Stopped, .Unknown => {
+            std.log.err("zig env command terminated unexpectedly {s}", .{@tagName(p.term)});
+            return error.ZigCommandFailed;
+        },
+    }
+
+    return try std.json.parseFromSlice(ZigEnvResult, ally, p.stdout, .{
+        .ignore_unknown_fields = true,
+    });
+}
+
+const ZigEnvResult = struct {
+    zig_exe: []u8,
+    lib_dir: []u8,
+    std_dir: []u8,
+    global_cache_dir: []u8,
+    version: []u8,
+};
