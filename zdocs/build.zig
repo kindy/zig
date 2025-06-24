@@ -19,6 +19,12 @@ fn add_zdocs_exe(b: *std.Build, optimize: std.builtin.OptimizeMode, target: std.
         .target = target,
     });
 
+    const is_embed = b.option(bool, "embed", "embed docs file") orelse (optimize != .Debug);
+    const exe_options = b.addOptions();
+    exe.root_module.addOptions("build_options", exe_options);
+
+    exe_options.addOption(bool, "embed", is_embed);
+
     const run = b.addRunArtifact(exe);
     if (b.args) |args| {
         run.addArgs(args);

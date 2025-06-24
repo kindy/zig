@@ -11,6 +11,8 @@ const Cache = std.Build.Cache;
 const print = std.debug.print;
 const log = std.log.scoped(.zdocs);
 
+const is_embed: bool = @import("build_options").embed;
+
 fn usage(status: u8) noreturn {
     io.getStdOut().writeAll(
         \\Usage: zdocs [options]
@@ -34,6 +36,8 @@ pub fn main() !void {
 
     var general_purpose_allocator: std.heap.GeneralPurposeAllocator(.{}) = .init;
     const gpa = general_purpose_allocator.allocator();
+
+    log.debug("is_embed: {}", .{is_embed});
 
     var argv = try std.process.argsWithAllocator(arena);
     defer argv.deinit();
@@ -155,11 +159,11 @@ const Context = struct {
 
 fn serveRequest(request: *std.http.Server.Request, context: *Context) !void {
     if (std.mem.eql(u8, request.head.target, "/")) {
-        try serveDocsFile(request, context, "docs/index.html", "text/html");
+        try serveDocsFile(request, context, .index_html, "text/html");
     } else if (std.mem.eql(u8, request.head.target, "/main.js")) {
-        try serveDocsFile(request, context, "docs/main.js", "application/javascript");
+        try serveDocsFile(request, context, .main_js, "application/javascript");
     } else if (std.mem.eql(u8, request.head.target, "/main.wasm")) {
-        try serveDocsFile(request, context, "docs/main.wasm", "application/wasm");
+        try serveDocsFile(request, context, .main_wasm, "application/wasm");
     } else if (std.mem.eql(u8, request.head.target, "/sources.tar")) {
         try serveSourcesTar(request, context);
     } else {
@@ -177,15 +181,51 @@ const cache_control_header: std.http.Header = .{
     .value = "max-age=0, must-revalidate",
 };
 
+const DocFile = enum {
+    index_html,
+    main_js,
+    main_wasm,
+
+    fn name(self: DocFile) []const u8 {
+        return switch (self) {
+            .index_html => "src/docs/index.html",
+            .main_js => "src/docs/main.js",
+            .main_wasm => "src/docs/main.wasm",
+        };
+    }
+
+    fn embed(self: DocFile) []const u8 {
+        if (comptime is_embed) {
+            return switch (self) {
+                .index_html => @embedFile("docs/index.html"),
+                .main_js => @embedFile("docs/main.js"),
+                .main_wasm => @embedFile("docs/main.wasm"),
+            };
+        } else {
+            unreachable;
+        }
+    }
+};
+
 fn serveDocsFile(
     request: *std.http.Server.Request,
     context: *Context,
-    name: []const u8,
+    file: DocFile,
     content_type: []const u8,
 ) !void {
     const gpa = context.gpa;
-    const file_contents = try std.fs.cwd().readFileAlloc(gpa, name, 10 * 1024 * 1024);
-    defer gpa.free(file_contents);
+    const file_contents = c: {
+        if (is_embed) {
+            break :c file.embed();
+        } else {
+            break :c try std.fs.cwd().readFileAlloc(gpa, file.name(), 10 * 1024 * 1024);
+        }
+    };
+    defer {
+        if (!is_embed) {
+            gpa.free(file_contents);
+        }
+    }
     try request.respond(file_contents, .{
         .extra_headers = &.{
             .{ .name = "content-type", .value = content_type },
@@ -244,14 +284,6 @@ fn serveSourcesTar(request: *std.http.Server.Request, context: *Context) !void {
     // intentionally omitting the pointless trailer
     //try archiver.finish();
     try response.end();
-}
-
-fn sendMessage(file: std.fs.File, tag: std.zig.Client.Message.Tag) !void {
-    const header: std.zig.Client.Message.Header = .{
-        .tag = tag,
-        .bytes_len = 0,
-    };
-    try file.writeAll(std.mem.asBytes(&header));
 }
 
 fn openBrowserTab(gpa: Allocator, url: []const u8) !void {
