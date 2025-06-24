@@ -17,8 +17,8 @@ fn usage(status: u8) noreturn {
         \\
         \\Options:
         \\  -h, --help                Print this help and exit.
-        \\  -Mstd                     std Module
-        \\  -M<mod_name>=<src_path>   Module name and root source path.
+        \\  -Mstd                     std Module.
+        \\  -M<mod_name>=<src_path>   Module name and module root source path.
         \\  -p <port>, --port <port>  Port to listen on. Default is 0, meaning an ephemeral port chosen by the system.
         \\  --[no-]open-browser       Force enabling or disabling opening a browser tab to the served website.
         \\                            By default, enabled unless a port is specified.
@@ -154,22 +154,13 @@ const Context = struct {
 };
 
 fn serveRequest(request: *std.http.Server.Request, context: *Context) !void {
-    if (std.mem.eql(u8, request.head.target, "/") or
-        std.mem.eql(u8, request.head.target, "/debug") or
-        std.mem.eql(u8, request.head.target, "/debug/"))
-    {
+    if (std.mem.eql(u8, request.head.target, "/")) {
         try serveDocsFile(request, context, "docs/index.html", "text/html");
-    } else if (std.mem.eql(u8, request.head.target, "/main.js") or
-        std.mem.eql(u8, request.head.target, "/debug/main.js"))
-    {
+    } else if (std.mem.eql(u8, request.head.target, "/main.js")) {
         try serveDocsFile(request, context, "docs/main.js", "application/javascript");
     } else if (std.mem.eql(u8, request.head.target, "/main.wasm")) {
-        try serveWasm(request, context, .ReleaseFast);
-    } else if (std.mem.eql(u8, request.head.target, "/debug/main.wasm")) {
-        try serveWasm(request, context, .Debug);
-    } else if (std.mem.eql(u8, request.head.target, "/sources.tar") or
-        std.mem.eql(u8, request.head.target, "/debug/sources.tar"))
-    {
+        try serveDocsFile(request, context, "docs/main.wasm", "application/wasm");
+    } else if (std.mem.eql(u8, request.head.target, "/sources.tar")) {
         try serveSourcesTar(request, context);
     } else {
         try request.respond("not found", .{
@@ -255,193 +246,6 @@ fn serveSourcesTar(request: *std.http.Server.Request, context: *Context) !void {
     try response.end();
 }
 
-fn serveWasm(
-    request: *std.http.Server.Request,
-    context: *Context,
-    optimize_mode: std.builtin.OptimizeMode,
-) !void {
-    const gpa = context.gpa;
-
-    var arena_instance = std.heap.ArenaAllocator.init(gpa);
-    defer arena_instance.deinit();
-    const arena = arena_instance.allocator();
-
-    // Do the compilation every request, so that the user can edit the files
-    // and see the changes without restarting the server.
-    const wasm_base_path = try buildWasmBinary(arena, context, optimize_mode);
-    const bin_name = try std.zig.binNameAlloc(arena, .{
-        .root_name = autodoc_root_name,
-        .target = std.zig.system.resolveTargetQuery(std.Build.parseTargetQuery(.{
-            .arch_os_abi = autodoc_arch_os_abi,
-            .cpu_features = autodoc_cpu_features,
-        }) catch unreachable) catch unreachable,
-        .output_mode = .Exe,
-    });
-    // std.http.Server does not have a sendfile API yet.
-    const bin_path = try wasm_base_path.join(arena, bin_name);
-    const file_contents = try bin_path.root_dir.handle.readFileAlloc(gpa, bin_path.sub_path, 10 * 1024 * 1024);
-    defer gpa.free(file_contents);
-    try request.respond(file_contents, .{
-        .extra_headers = &.{
-            .{ .name = "content-type", .value = "application/wasm" },
-            cache_control_header,
-        },
-    });
-}
-
-const autodoc_root_name = "autodoc";
-const autodoc_arch_os_abi = "wasm32-freestanding";
-const autodoc_cpu_features = "baseline+atomics+bulk_memory+multivalue+mutable_globals+nontrapping_fptoint+reference_types+sign_ext";
-
-fn buildWasmBinary(
-    arena: Allocator,
-    context: *Context,
-    optimize_mode: std.builtin.OptimizeMode,
-) !Cache.Path {
-    const gpa = context.gpa;
-
-    var argv: std.ArrayListUnmanaged([]const u8) = .empty;
-
-    try argv.appendSlice(arena, &.{
-        context.zig_exe_path, //
-        "build-exe", //
-        "-fno-entry", //
-        "-O", @tagName(optimize_mode), //
-        "-target", autodoc_arch_os_abi, //
-        "-mcpu", autodoc_cpu_features, //
-        "--cache-dir", context.global_cache_path, //
-        "--global-cache-dir", context.global_cache_path, //
-        "--name", autodoc_root_name, //
-        "-rdynamic", //
-        try std.fmt.allocPrint(
-            arena,
-            "-Mroot={s}",
-            .{try std.fs.cwd().realpathAlloc(arena, "src/wasm/main.zig")},
-        ),
-        "--listen=-", //
-    });
-
-    var child = std.process.Child.init(argv.items, gpa);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Pipe;
-    try child.spawn();
-
-    var poller = std.io.poll(gpa, enum { stdout, stderr }, .{
-        .stdout = child.stdout.?,
-        .stderr = child.stderr.?,
-    });
-    defer poller.deinit();
-
-    try sendMessage(child.stdin.?, .update);
-    try sendMessage(child.stdin.?, .exit);
-
-    const Header = std.zig.Server.Message.Header;
-    var result: ?Cache.Path = null;
-    var result_error_bundle = std.zig.ErrorBundle.empty;
-
-    const stdout = poller.fifo(.stdout);
-
-    poll: while (true) {
-        while (stdout.readableLength() < @sizeOf(Header)) {
-            if (!(try poller.poll())) break :poll;
-        }
-        const header = stdout.reader().readStruct(Header) catch unreachable;
-        while (stdout.readableLength() < header.bytes_len) {
-            if (!(try poller.poll())) break :poll;
-        }
-        const body = stdout.readableSliceOfLen(header.bytes_len);
-
-        switch (header.tag) {
-            .zig_version => {
-                if (!std.mem.eql(u8, builtin.zig_version_string, body)) {
-                    return error.ZigProtocolVersionMismatch;
-                }
-            },
-            .error_bundle => {
-                const EbHdr = std.zig.Server.Message.ErrorBundle;
-                const eb_hdr = @as(*align(1) const EbHdr, @ptrCast(body));
-                const extra_bytes =
-                    body[@sizeOf(EbHdr)..][0 .. @sizeOf(u32) * eb_hdr.extra_len];
-                const string_bytes =
-                    body[@sizeOf(EbHdr) + extra_bytes.len ..][0..eb_hdr.string_bytes_len];
-                // TODO: use @ptrCast when the compiler supports it
-                const unaligned_extra = std.mem.bytesAsSlice(u32, extra_bytes);
-                const extra_array = try arena.alloc(u32, unaligned_extra.len);
-                @memcpy(extra_array, unaligned_extra);
-                result_error_bundle = .{
-                    .string_bytes = try arena.dupe(u8, string_bytes),
-                    .extra = extra_array,
-                };
-            },
-            .emit_digest => {
-                const EmitDigest = std.zig.Server.Message.EmitDigest;
-                const emit_digest = @as(*align(1) const EmitDigest, @ptrCast(body));
-                if (!emit_digest.flags.cache_hit) {
-                    std.log.info("source changes detected; rebuilt wasm component", .{});
-                }
-                const digest = body[@sizeOf(EmitDigest)..][0..Cache.bin_digest_len];
-                result = .{
-                    .root_dir = Cache.Directory.cwd(),
-                    .sub_path = try std.fs.path.join(arena, &.{
-                        context.global_cache_path, "o" ++ std.fs.path.sep_str ++ Cache.binToHex(digest.*),
-                    }),
-                };
-            },
-            else => {}, // ignore other messages
-        }
-
-        stdout.discard(body.len);
-    }
-
-    const stderr = poller.fifo(.stderr);
-    if (stderr.readableLength() > 0) {
-        const owned_stderr = try stderr.toOwnedSlice();
-        defer gpa.free(owned_stderr);
-        std.debug.print("{s}", .{owned_stderr});
-    }
-
-    // Send EOF to stdin.
-    child.stdin.?.close();
-    child.stdin = null;
-
-    switch (try child.wait()) {
-        .Exited => |code| {
-            if (code != 0) {
-                std.log.err(
-                    "the following command exited with error code {d}:\n{s}",
-                    .{ code, try std.Build.Step.allocPrintCmd(arena, null, argv.items) },
-                );
-                return error.WasmCompilationFailed;
-            }
-        },
-        .Signal, .Stopped, .Unknown => {
-            std.log.err(
-                "the following command terminated unexpectedly:\n{s}",
-                .{try std.Build.Step.allocPrintCmd(arena, null, argv.items)},
-            );
-            return error.WasmCompilationFailed;
-        },
-    }
-
-    if (result_error_bundle.errorMessageCount() > 0) {
-        const color = std.zig.Color.auto;
-        result_error_bundle.renderToStdErr(color.renderOptions());
-        std.log.err("the following command failed with {d} compilation errors:\n{s}", .{
-            result_error_bundle.errorMessageCount(),
-            try std.Build.Step.allocPrintCmd(arena, null, argv.items),
-        });
-        return error.WasmCompilationFailed;
-    }
-
-    return result orelse {
-        std.log.err("child process failed to report result\n{s}", .{
-            try std.Build.Step.allocPrintCmd(arena, null, argv.items),
-        });
-        return error.WasmCompilationFailed;
-    };
-}
-
 fn sendMessage(file: std.fs.File, tag: std.zig.Client.Message.Tag) !void {
     const header: std.zig.Client.Message.Header = .{
         .tag = tag,
@@ -470,7 +274,7 @@ fn openBrowserTabThread(gpa: Allocator, url: []const u8) !void {
     _ = try child.wait();
 }
 
-pub fn fatal(comptime format: []const u8, args: anytype) noreturn {
+fn fatal(comptime format: []const u8, args: anytype) noreturn {
     std.log.err(format, args);
     std.process.exit(1);
 }
