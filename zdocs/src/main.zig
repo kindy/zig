@@ -21,6 +21,7 @@ fn usage(status: u8) noreturn {
         \\  -h, --help                Print this help and exit.
         \\  -Mstd                     std Module.
         \\  -M<mod_name>=<src_path>   Module name and module root source path.
+        \\  --host <host>             Host to listen on. Default is 127.0.0.1.
         \\  -p <port>, --port <port>  Port to listen on. Default is 0, meaning an ephemeral port chosen by the system.
         \\  --[no-]open-browser       Force enabling or disabling opening a browser tab to the served website.
         \\                            By default, enabled unless a port is specified.
@@ -43,26 +44,26 @@ pub fn main() !void {
     defer argv.deinit();
     assert(argv.skip());
 
-    const v = try getZigEnv(gpa);
-    defer v.deinit();
-
-    const zig_lib_directory = v.value.lib_dir;
-    const zig_exe_path = v.value.zig_exe;
-    const global_cache_path = v.value.global_cache_dir;
-
-    var lib_dir = try std.fs.cwd().openDir(zig_lib_directory, .{});
-    defer lib_dir.close();
+    const opt_lib_dir = try getZigLibDir(gpa);
+    defer {
+        if (opt_lib_dir) |lib_dir| {
+            @constCast(&lib_dir).close();
+        }
+    }
 
     var mod_src_path: []const u8 = "";
     var mod_name: []const u8 = "";
 
     var listen_port: u16 = 0;
+    var listen_host: []const u8 = "127.0.0.1";
     var force_open_browser: ?bool = null;
     while (argv.next()) |arg| {
         log.debug("arg: '{s}'", .{arg});
 
         if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--help")) {
             usage(0);
+        } else if (mem.eql(u8, arg, "-h") or mem.eql(u8, arg, "--host")) {
+            listen_host = argv.next() orelse usage(1);
         } else if (mem.eql(u8, arg, "-p") or mem.eql(u8, arg, "--port")) {
             listen_port = std.fmt.parseInt(u16, argv.next() orelse usage(1), 10) catch |err| {
                 std.log.err("expected port number: {}", .{err});
@@ -74,7 +75,10 @@ pub fn main() !void {
             mod_name = it.next().?;
             mod_src_path = it.next() orelse d: {
                 if (mem.eql(u8, mod_name, "std")) {
-                    break :d try lib_dir.realpathAlloc(gpa, "std/std.zig");
+                    if (opt_lib_dir) |lib_dir| {
+                        break :d try lib_dir.realpathAlloc(gpa, "std/std.zig");
+                    }
+                    fatal("-Mstd need zig installed, you can use -Mstd=<path-to-std/std.zig> instead", .{});
                 }
                 fatal("expected module root_src_path after -M{d}", .{mod_name});
             };
@@ -94,10 +98,11 @@ pub fn main() !void {
         usage(1);
     }
 
-    const address = std.net.Address.parseIp("127.0.0.1", listen_port) catch unreachable;
+    const address = std.net.Address.parseIp(listen_host, listen_port) catch unreachable;
     var http_server = try address.listen(.{});
     const port = http_server.listen_address.in.getPort();
     const url_with_newline = try std.fmt.allocPrint(arena, "http://127.0.0.1:{d}/\n", .{port});
+    // const url_with_newline = try std.fmt.allocPrint(arena, "http://{}/\n", .{http_server.listen_address.in});
     std.io.getStdOut().writeAll(url_with_newline) catch {};
     if (should_open_browser) {
         openBrowserTab(gpa, url_with_newline[0 .. url_with_newline.len - 1 :'\n']) catch |err| {
@@ -107,11 +112,6 @@ pub fn main() !void {
 
     var context: Context = .{
         .gpa = gpa,
-        .zig_exe_path = zig_exe_path,
-        .global_cache_path = global_cache_path,
-        .lib_dir = lib_dir,
-        .zig_lib_directory = zig_lib_directory,
-
         .mod_src_path = mod_src_path,
         .mod_name = mod_name,
     };
@@ -148,11 +148,6 @@ fn accept(context: *Context, connection: std.net.Server.Connection) void {
 
 const Context = struct {
     gpa: Allocator,
-    lib_dir: std.fs.Dir,
-    zig_lib_directory: []const u8,
-    zig_exe_path: []const u8,
-    global_cache_path: []const u8,
-
     mod_src_path: []const u8,
     mod_name: []const u8,
 };
@@ -311,11 +306,19 @@ fn fatal(comptime format: []const u8, args: anytype) noreturn {
     std.process.exit(1);
 }
 
-fn getZigEnv(ally: std.mem.Allocator) !std.json.Parsed(ZigEnvResult) {
-    const p = try std.process.Child.run(.{
+fn getZigLibDir(ally: std.mem.Allocator) !?std.fs.Dir {
+    const p = std.process.Child.run(.{
         .allocator = ally,
         .argv = &.{ "zig", "env" },
-    });
+    }) catch |err| {
+        log.debug("run zig env fail: {s}", .{@errorName(err)});
+        return null;
+    };
+
+    const ZigEnvResult = struct {
+        lib_dir: []u8,
+    };
+
     defer {
         ally.free(p.stdout);
         ally.free(p.stderr);
@@ -326,25 +329,24 @@ fn getZigEnv(ally: std.mem.Allocator) !std.json.Parsed(ZigEnvResult) {
     switch (p.term) {
         .Exited => |code| {
             if (code != 0) {
-                std.log.err("zig env command exited with code {d}\n stderr: {s}", .{ code, p.stderr });
-                return error.ZigCommandFailed;
+                log.warn("zig env command exited with code {d}\n stderr: {s}", .{ code, p.stderr });
+                return null;
             }
         },
         .Signal, .Stopped, .Unknown => {
-            std.log.err("zig env command terminated unexpectedly {s}", .{@tagName(p.term)});
-            return error.ZigCommandFailed;
+            log.warn("zig env command terminated unexpectedly {s}", .{@tagName(p.term)});
+            return null;
         },
     }
 
-    return try std.json.parseFromSlice(ZigEnvResult, ally, p.stdout, .{
+    const v = try std.json.parseFromSlice(ZigEnvResult, ally, p.stdout, .{
         .ignore_unknown_fields = true,
     });
-}
 
-const ZigEnvResult = struct {
-    zig_exe: []u8,
-    lib_dir: []u8,
-    std_dir: []u8,
-    global_cache_dir: []u8,
-    version: []u8,
-};
+    defer v.deinit();
+
+    return std.fs.cwd().openDir(v.value.lib_dir, .{}) catch |err| {
+        log.warn("unable to open lib dir '{s}': {s}", .{ v.value.lib_dir, @errorName(err) });
+        return null;
+    };
+}
